@@ -1,90 +1,88 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import json, os, asyncio, time
+import os, json, time, httpx
 
 app = FastAPI()
-DATA_FILE = "slips.json"
-_last_modified = time.time()
-_sse_clients: list[asyncio.Queue] = []
 
+# ── Upstash Redis REST client ────────────────────────────
+# These env vars are auto-injected by Vercel when you connect
+# the Upstash Redis integration from the Marketplace.
+REDIS_URL   = os.environ.get("KV_REST_API_URL", "")
+REDIS_TOKEN = os.environ.get("KV_REST_API_TOKEN", "")
+SLIPS_KEY   = "slipboard:slips"
+
+def redis(command: list):
+    """Execute a Redis command via Upstash REST API."""
+    if not REDIS_URL or not REDIS_TOKEN:
+        raise RuntimeError(
+            "KV_REST_API_URL and KV_REST_API_TOKEN env vars are not set. "
+            "Connect Upstash Redis in your Vercel project Marketplace."
+        )
+    resp = httpx.post(
+        f"{REDIS_URL.rstrip('/')}/",
+        headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+        json=command,
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
+def load_slips() -> list:
+    raw = redis(["GET", SLIPS_KEY])
+    if not raw:
+        return []
+    return json.loads(raw)
+
+
+def save_slips(slips: list):
+    redis(["SET", SLIPS_KEY, json.dumps(slips)])
+
+
+# ── Models ───────────────────────────────────────────────
 class Slip(BaseModel):
     text: str
 
-def load_slips():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
 
-def save_slips(data):
-    global _last_modified
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    _last_modified = time.time()
-    # Notify all SSE clients
-    for q in list(_sse_clients):
-        try:
-            q.put_nowait("update")
-        except:
-            pass
-
+# ── Routes ───────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def home():
     with open("static/index.html", encoding="utf-8") as f:
         return f.read()
 
+
 @app.get("/api/slips")
 def get_slips():
-    return JSONResponse(load_slips())
+    try:
+        return JSONResponse(load_slips())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-@app.get("/api/slips/timestamp")
-def get_timestamp():
-    return JSONResponse({"ts": _last_modified})
-
-@app.get("/api/events")
-async def sse_events(request: Request):
-    q: asyncio.Queue = asyncio.Queue()
-    _sse_clients.append(q)
-
-    async def event_stream():
-        try:
-            # Send initial ping
-            yield "data: ping\n\n"
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    msg = await asyncio.wait_for(q.get(), timeout=20)
-                    yield f"data: {msg}\n\n"
-                except asyncio.TimeoutError:
-                    yield "data: ping\n\n"
-        finally:
-            _sse_clients.remove(q)
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-    )
 
 @app.post("/api/slips")
 def add_slip(slip: Slip):
-    slips = load_slips()
-    slips.insert(0, {"text": slip.text, "ts": time.time()})
-    save_slips(slips)
-    return {"success": True}
+    try:
+        slips = load_slips()
+        slips.insert(0, {"text": slip.text, "ts": time.time()})
+        save_slips(slips)
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 
 @app.delete("/api/slips/{index}")
 def delete_slip(index: int):
-    slips = load_slips()
-    if 0 <= index < len(slips):
-        slips.pop(index)
-        save_slips(slips)
-    return {"success": True}
+    try:
+        slips = load_slips()
+        if 0 <= index < len(slips):
+            slips.pop(index)
+            save_slips(slips)
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
+
+# ── Static files (Vercel serves these via routes) ────────
 app.mount("/static", StaticFiles(directory="static"), name="static")

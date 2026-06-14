@@ -1,7 +1,7 @@
 {
   "name": "SlipBoard",
   "short_name": "SlipBoard",
-  "description": "Live text transfer between any open tab",
+  "description": "Live text transfer between any open tab or device",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#07070f",
